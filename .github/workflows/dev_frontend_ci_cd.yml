@@ -1,0 +1,161 @@
+name: Frontend-App-CI-CD-Dev
+
+env:
+  AWS_REGION       : "us-east-1"
+  IMAGE_NAME       : "practice_project_frontend"
+  NEW_DEV_IMAGE    : "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/dev_practice_project_frontend:latest"
+  APP_VERSION      : "latest"
+  ENV              : "dev"
+  ECS_SERVICE      : "dev_frontend"
+  ECS_CLUSTER      : "dev-ECS-Cluster"
+  TASK_DEFINITION  : "dev_practice_project_frontend"
+  CONTAINER_NAME   : "dev_frontend"
+  BACKEND_ADDRESS  : "https://dev-api.${{ your_domain }}"
+  WORKING_DIRECTORY: .
+
+on:
+  push:
+    branches:
+      - "development"
+    paths-ignore:
+      - "**.md"
+    
+jobs:
+  build:
+    name: Build the Frontend App
+    runs-on: ubuntu-latest
+
+    steps:
+   
+    - name: Checkout repository
+      uses: actions/checkout@v2
+    
+    - name: Creating .env file
+      run: |
+            tee .env << EOF
+            GENERATE_SOURCEMAP=false
+            PORT=3001
+            REACT_APP_BACKEND_HOSTNAME=
+            REACT_APP_CONSUMER_KEY_TWITTER=some_value
+            REACT_APP_GOOGLE_CLIENT_ID=some_value
+            REACT_APP_FACEBOOK_APP_ID=some_value
+            EOF
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v1
+
+    - name: Delete Old Artifacts
+      uses: actions/github-script@v6
+      id: artifact
+      with:
+        script: |
+          const res = await github.rest.actions.listArtifactsForRepo({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+          })
+
+          res.data.artifacts
+            .filter(({ name }) => name === '${{ env.IMAGE_NAME }}')
+            .forEach(({ id }) => {
+              github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: id,
+              })
+            })
+
+    - name: Build and export
+      uses: docker/build-push-action@v2
+      id:   build-image
+      with:
+        context: .
+        tags: ${{ env.IMAGE_NAME }}:${{ env.APP_VERSION }}
+        outputs: type=docker,dest=/tmp/${{ env.IMAGE_NAME }}.tar
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: ${{ env.IMAGE_NAME }}
+        path: /tmp/${{ env.IMAGE_NAME }}.tar
+  
+  publish:
+    name: Push Frontend Image to Dev-ECR
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      
+      - name: Download artifact
+        uses: actions/download-artifact@v2
+        with:
+          name: ${{ env.IMAGE_NAME }}
+          path: /tmp
+      
+      - name: Load image
+        run: |
+          docker load --input /tmp/${{ env.IMAGE_NAME }}.tar
+          docker image ls -a
+
+      - name: Configure my AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id     : ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key : ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region            : ${{ env.AWS_REGION }}
+
+      - name: Authentication Docker Client to AWS ECR
+        run: |
+              aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+              docker login --username AWS \
+              --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+
+      - name: Push to AWS ECR
+        run: |
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.APP_VERSION }} \
+          ${{ env.NEW_DEV_IMAGE }}
+          docker push ${{ env.NEW_DEV_IMAGE }}
+
+  deploy:
+    name: Deploy to AWS ECS Dev Environment
+    runs-on: ubuntu-latest
+    needs: [ build, publish ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Configure my AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id     : ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key : ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region            : ${{ env.AWS_REGION }}
+
+      - name: Authentication Docker Client to AWS ECR
+        run: |
+              aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+              docker login --username AWS \
+              --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+      
+      - name: Download task definition
+        run: |
+              aws ecs describe-task-definition --task-definition ${{ env.TASK_DEFINITION }} --query taskDefinition > task-definition.json
+              cat task-definition.json
+      
+      - name: Fill in the image ID in the Amazon ECS Task Definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ env.NEW_DEV_IMAGE }}
+      
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true

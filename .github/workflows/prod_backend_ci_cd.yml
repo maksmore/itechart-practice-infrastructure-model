@@ -1,0 +1,93 @@
+name: Backend-App-CI-CD-Prod
+
+env:
+  AWS_REGION : "us-east-1"
+  PROD_IMAGE_NAME  : "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/practice_project_backend:latest"
+  NEW_DEV_IMAGE    : "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/dev_practice_project_backend:latest"
+  APP_VERSION      : "latest"
+  ENV              : "prod"
+  ECS_SERVICE      : "prod_backend"
+  ECS_CLUSTER      : "prod-ECS-Cluster"
+  TASK_DEFINITION  : "prod_practice_project_backend"
+  CONTAINER_NAME   : "prod_backend"
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [ master ]
+    paths-ignore:
+      - "**.md"
+      - "aws_terraform/**"
+  push:
+    branches:
+      - "master"
+    paths-ignore:
+      - "**.md"
+      - "aws_terraform/**"
+jobs:
+  ci:
+    name: Push Image to Prod-ECR
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.merged == true
+
+    steps:
+      - name: Configure my AWS Credentials
+        id: aws-creds
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id     : ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key : ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region            : ${{ env.AWS_REGION }}
+      
+      - name: Authentication Docker Client to AWS ECR
+        run: |
+              aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+              docker login --username AWS \
+              --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+
+      - name: Pulling the Backend Image From Dev-ECR & Push to Prod-ECR
+        run: |
+              docker pull ${{ env.NEW_DEV_IMAGE }}
+              docker tag ${{ env.NEW_DEV_IMAGE }} ${{ env.PROD_IMAGE_NAME }}
+              docker push ${{ env.PROD_IMAGE_NAME }}
+
+  deploy:
+    name: Deploy Image to Prod
+    runs-on: ubuntu-latest
+    needs: ci
+
+    steps:
+      - name: Configure my AWS Credentials
+        id: aws-creds
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id     : ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key : ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region            : ${{ env.AWS_REGION }}
+
+      - name: Authentication Docker Client to AWS ECR
+        run: |
+              aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+              docker login --username AWS \
+              --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+      
+      - name: Download task definition
+        run: |
+              aws ecs describe-task-definition --task-definition ${{ env.TASK_DEFINITION }} --query taskDefinition > task-definition.json
+              cat task-definition.json
+      
+      - name: Fill in the image ID in the Amazon ECS Task Definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ env.NEW_DEV_IMAGE }}
+      
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
